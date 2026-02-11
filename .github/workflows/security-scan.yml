@@ -1,0 +1,136 @@
+name: Agent Security Scan
+
+on:
+  push:
+    paths:
+      - '**.sol'
+  pull_request:
+    paths:
+      - '**.sol'
+  workflow_dispatch:
+
+jobs:
+  security-scan:
+    name: Security Vulnerability Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    
+    - name: Install Agent Security Scanner
+      run: |
+        curl -sSL https://raw.githubusercontent.com/arithmosquillsworth/agent-security-scanner/main/scanner.py -o scanner.py
+        chmod +x scanner.py
+    
+    - name: Run Security Scan
+      id: scan
+      run: |
+        # Find all Solidity files
+        find . -name "*.sol" -type f | while read contract; do
+          echo "Scanning: $contract"
+          python3 scanner.py "$contract" --format json --output "report-$(basename $contract .sol).json"
+        done
+        
+        # Generate summary
+        echo "## Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        for report in report-*.json; do
+          if [ -f "$report" ]; then
+            score=$(python3 -c "import json; print(json.load(open('$report'))['summary']['security_score'])")
+            risk=$(python3 -c "import json; print(json.load(open('$report'))['summary']['risk_level'])")
+            critical=$(python3 -c "import json; print(json.load(open('$report'))['summary']['severity_counts']['CRITICAL'])")
+            high=$(python3 -c "import json; print(json.load(open('$report'))['summary']['severity_counts']['HIGH'])")
+            
+            contract_name=$(basename $report .json | sed 's/report-//')
+            
+            if [ "$critical" -gt 0 ]; then
+              emoji="🔴"
+            elif [ "$high" -gt 0 ]; then
+              emoji="🟠"
+            elif [ "$score" -ge 90 ]; then
+              emoji="🟢"
+            else
+              emoji="🟡"
+            fi
+            
+            echo "### $emoji $contract_name" >> $GITHUB_STEP_SUMMARY
+            echo "- **Score:** $score/100" >> $GITHUB_STEP_SUMMARY
+            echo "- **Risk Level:** $risk" >> $GITHUB_STEP_SUMMARY
+            echo "- **Critical:** $critical | **High:** $high" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+        done
+    
+    - name: Upload Scan Reports
+      uses: actions/upload-artifact@v4
+      with:
+        name: security-scan-reports
+        path: report-*.json
+    
+    - name: Check for Critical Vulnerabilities
+      run: |
+        critical_found=0
+        for report in report-*.json; do
+          if [ -f "$report" ]; then
+            critical=$(python3 -c "import json; print(json.load(open('$report'))['summary']['severity_counts']['CRITICAL'])")
+            if [ "$critical" -gt 0 ]; then
+              critical_found=1
+              echo "::error::Critical vulnerabilities found in $report"
+            fi
+          fi
+        done
+        
+        if [ "$critical_found" -eq 1 ]; then
+          echo "::error::Critical vulnerabilities detected. Fix before merging."
+          exit 1
+        fi
+      shell: bash
+    
+    - name: Comment PR
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          const path = require('path');
+          
+          let body = '## 🔒 Agent Security Scan Results\n\n';
+          
+          const files = fs.readdirSync('.').filter(f => f.startsWith('report-') && f.endsWith('.json'));
+          
+          if (files.length === 0) {
+            body += 'No Solidity files found to scan.\n';
+          } else {
+            files.forEach(file => {
+              const report = JSON.parse(fs.readFileSync(file, 'utf8'));
+              const contractName = path.basename(file, '.json').replace('report-', '');
+              const { security_score, risk_level, severity_counts } = report.summary;
+              
+              let emoji = '🟢';
+              if (severity_counts.CRITICAL > 0) emoji = '🔴';
+              else if (severity_counts.HIGH > 0) emoji = '🟠';
+              else if (security_score < 90) emoji = '🟡';
+              
+              body += `### ${emoji} ${contractName}\n`;
+              body += `- **Score:** ${security_score}/100\n`;
+              body += `- **Risk Level:** ${risk_level}\n`;
+              body += `- **Vulnerabilities:** ${severity_counts.CRITICAL} Critical, ${severity_counts.HIGH} High, ${severity_counts.MEDIUM} Medium\n`;
+              body += '\n';
+            });
+          }
+          
+          body += '\n---\n*Scanned with [Agent Security Scanner](https://github.com/arithmosquillsworth/agent-security-scanner)*';
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: body
+          });
